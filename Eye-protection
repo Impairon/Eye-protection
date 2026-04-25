@@ -1,0 +1,878 @@
+"""
+صحبك ابو العنين 🤓 - Eye Protection Alarm with Usage Timer (R.A.T.I.C)
+
+A desktop application to remind users to rest their eyes (20‑20‑20 rule).
+Features a circular progress timer, system tray integration, pause/resume,
+and a separate usage timer that tracks total active computer time.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+from dataclasses import dataclass
+from enum import Enum, auto
+from pathlib import Path
+from typing import Optional
+
+import pygame
+from PyQt5.QtCore import (
+    QEasingCurve,
+    QPoint,
+    QPropertyAnimation,
+    Qt,
+    QTime,
+    QTimer,
+    pyqtProperty,
+)
+from PyQt5.QtGui import (
+    QBrush,
+    QColor,
+    QFont,
+    QIcon,
+    QLinearGradient,
+    QPainter,
+    QPen,
+    QPixmap,
+)
+from PyQt5.QtWidgets import (
+    QApplication,
+    QGraphicsDropShadowEffect,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMenu,
+    QPushButton,
+    QSizePolicy,
+    QSystemTrayIcon,
+    QVBoxLayout,
+    QWidget,
+)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+
+# ----------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------
+@dataclass(frozen=True)
+class TimerConfig:
+    """Configuration for timer durations and intervals."""
+    
+    work_duration_minutes: int = 20
+    auto_hide_delay_ms: int = 2500         
+    animation_duration_ms: int = 500
+    progress_animation_ms: int = 900
+    clock_update_interval_ms: int = 1000
+    countdown_interval_ms: int = 1000
+    
+    @property
+    def work_duration_seconds(self) -> int:
+        """Total work duration in seconds."""
+        return self.work_duration_minutes * 60
+
+
+@dataclass(frozen=True)
+class UIConfig:
+    """Configuration for UI dimensions and styling."""
+    
+    window_width: int = 700                 
+    window_height: int = 680                
+    window_margin: int = 20
+    progress_size: int = 200
+    progress_stroke_width: int = 12
+    border_radius: int = 30
+    button_height: int = 48
+    button_width: int = 140
+    button_radius: int = 24
+
+
+@dataclass(frozen=True)
+class ColorPalette:
+    """Application color palette."""
+    
+    bg_gradient_start: str = "#2a2a3e"
+    bg_gradient_end: str = "#161625"
+    border_color: str = "#32324d"
+    progress_track: tuple[int, int, int, int] = (45, 45, 65, 180)
+    progress_start: str = "#4cd137"
+    progress_end: str = "#2196f3"
+    text_primary: str = "#ffffff"
+    text_secondary: str = "#a0a0c0"
+    text_muted: str = "#57606f"
+    text_accent: str = "#4cd137"
+    btn_success: str = "#4cd137"
+    btn_warning: str = "#f1c40f"
+    btn_danger: str = "#ff4757"
+    btn_info: str = "#3498db"
+    btn_disabled_bg: str = "#2f3542"
+    btn_disabled_text: str = "#57606f"
+    btn_text: str = "#1e1e2f"
+
+
+class TimerState(Enum):
+    RUNNING = auto()
+    PAUSED = auto()
+    ALARM = auto()
+    IDLE = auto()
+
+
+# ----------------------------------------------------------------------
+# Circular Progress Widget
+# ----------------------------------------------------------------------
+class CircularProgress(QWidget):
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        size: int = UIConfig.progress_size,
+        stroke_width: int = UIConfig.progress_stroke_width,
+        total_seconds: int = TimerConfig().work_duration_seconds,
+        colors: Optional[ColorPalette] = None
+    ) -> None:
+        super().__init__(parent)
+        self._value: float = 100.0
+        self._size = size
+        self._stroke_width = stroke_width
+        self._total_seconds = total_seconds
+        self._colors = colors or ColorPalette()
+        self.setFixedSize(size, size)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+    def setValue(self, value: float) -> None:
+        clamped_value = max(0.0, min(100.0, value))
+        if self._value != clamped_value:
+            self._value = clamped_value
+            self.update()
+
+    def value(self) -> float:
+        return self._value
+
+    def setTotalSeconds(self, seconds: int) -> None:
+        self._total_seconds = seconds
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        padding = self._stroke_width // 2 + 4
+        rect = self.rect().adjusted(padding, padding, -padding, -padding)
+
+        # Background track
+        pen = QPen()
+        pen.setWidth(self._stroke_width)
+        pen.setColor(QColor(*self._colors.progress_track))
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        painter.drawEllipse(rect)
+
+        # Progress arc
+        if self._value > 0:
+            gradient = QLinearGradient(rect.topLeft(), rect.bottomRight())
+            gradient.setColorAt(0, QColor(self._colors.progress_start))
+            gradient.setColorAt(1, QColor(self._colors.progress_end))
+            pen.setBrush(QBrush(gradient))
+            painter.setPen(pen)
+            start_angle = 90 * 16
+            span_angle = -int(360 * 16 * (self._value / 100))
+            painter.drawArc(rect, start_angle, span_angle)
+
+        # Center text
+        total_seconds = int((self._value / 100) * self._total_seconds)
+        minutes, seconds = divmod(total_seconds, 60)
+        time_text = f"{minutes:02d}:{seconds:02d}"
+        font = QFont("Segoe UI", 20, QFont.Bold)
+        painter.setFont(font)
+        painter.setPen(QColor(self._colors.text_primary))
+        painter.drawText(self.rect(), Qt.AlignCenter, time_text)
+
+    @pyqtProperty(float)
+    def progress(self) -> float:
+        return self._value
+
+    @progress.setter
+    def progress(self, value: float) -> None:
+        self.setValue(value)
+
+
+# ----------------------------------------------------------------------
+# Audio Manager (not used for alarm but kept for potential future use)
+# ----------------------------------------------------------------------
+class AudioManager:
+    def __init__(self, sound_file: str = "alarmclock.wav") -> None:
+        self._sound_file = Path(sound_file)
+        self._initialized = False
+        self._initialize_audio()
+
+    def _initialize_audio(self) -> None:
+        try:
+            pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
+            self._initialized = True
+        except pygame.error as e:
+            logger.warning(f"Audio init failed: {e}")
+
+    def play_alarm(self) -> None:
+        if not self._initialized:
+            return
+        try:
+            if self._sound_file.exists():
+                pygame.mixer.music.load(str(self._sound_file))
+                pygame.mixer.music.play()
+        except Exception as e:
+            logger.error(f"Playback error: {e}")
+
+    def stop(self) -> None:
+        if self._initialized:
+            try:
+                pygame.mixer.music.stop()
+            except:
+                pass
+
+    def cleanup(self) -> None:
+        if self._initialized:
+            try:
+                pygame.mixer.quit()
+            except:
+                pass
+
+
+# ----------------------------------------------------------------------
+# Main Application Window
+# ----------------------------------------------------------------------
+class EyeProtectionAlarm(QMainWindow):
+    def __init__(
+        self,
+        timer_config: Optional[TimerConfig] = None,
+        ui_config: Optional[UIConfig] = None,
+        colors: Optional[ColorPalette] = None
+    ) -> None:
+        super().__init__()
+        
+        self._timer_config = timer_config or TimerConfig()
+        self._ui_config = ui_config or UIConfig()
+        self._colors = colors or ColorPalette()
+        
+        # Main timer state
+        self._state = TimerState.RUNNING
+        self._remaining_seconds = self._timer_config.work_duration_seconds
+        
+        # Usage timer (R.A.T.I.C)
+        self._usage_seconds = 0
+        self._usage_timer = QTimer(self)
+        self._usage_timer.timeout.connect(self._update_usage_timer)
+        
+        # Window state
+        self._is_minimized = False
+        self._is_animating = False
+        self._original_pos = QPoint()
+        self._is_first_launch = True   # not really used anymore because all delays are same
+        self._drag_offset = QPoint()
+        
+        # Components
+        self._audio_manager = AudioManager()
+        
+        # UI elements
+        self._progress_bar: CircularProgress
+        self._time_display: QLabel
+        self._status_label: QLabel
+        self._usage_label: QLabel
+        self._pause_btn: QPushButton
+        self._reset_btn: QPushButton
+        self._ratic_btn: QPushButton
+        self._tray_icon: QSystemTrayIcon
+        
+        # Animations
+        self._slide_anim: QPropertyAnimation
+        self._progress_anim: QPropertyAnimation
+        
+        # Timers
+        self._countdown_timer: QTimer
+        self._auto_hide_timer: QTimer
+        self._clock_timer: QTimer
+        
+        # Build UI
+        self._setup_window()
+        self._setup_ui()
+        self._setup_animations()
+        self._setup_tray_icon()
+        self._setup_timers()
+        
+        # Start usage timer if initial state is RUNNING
+        self._start_usage_timer()
+        
+        logger.info("صحبك ابو العنين initialized")
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+    def _setup_window(self) -> None:
+        self.setWindowTitle("صحبك ابو العنين🤓")
+        self.setFixedSize(self._ui_config.window_width, self._ui_config.window_height)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        
+        # Center on screen
+        screen = QApplication.primaryScreen().geometry()
+        self._original_pos = QPoint(
+            (screen.width() - self._ui_config.window_width) // 2,
+            (screen.height() - self._ui_config.window_height) // 2
+        )
+        self.move(self._original_pos)
+
+    def _setup_ui(self) -> None:
+        container = QWidget()
+        container.setObjectName("Container")
+        container.setStyleSheet(self._get_container_style())
+        
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(40)
+        shadow.setOffset(0, 10)
+        shadow.setColor(QColor(0, 0, 0, 200))
+        container.setGraphicsEffect(shadow)
+        self.setCentralWidget(container)
+
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(30, 25, 30, 30)
+        layout.setSpacing(8)
+
+        layout.addLayout(self._create_header())
+        
+        self._time_display = self._create_time_display()
+        layout.addWidget(self._time_display)
+
+        self._progress_bar = CircularProgress(
+            total_seconds=self._timer_config.work_duration_seconds,
+            colors=self._colors
+        )
+        layout.addWidget(self._progress_bar, 0, Qt.AlignCenter)
+
+        layout.addLayout(self._create_buttons())
+        
+        self._usage_label = self._create_usage_label()
+        layout.addWidget(self._usage_label)
+        
+        self._status_label = self._create_status_label()
+        layout.addWidget(self._status_label)
+
+    def _get_container_style(self) -> str:
+        return f"""
+            #Container {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:1,
+                    stop:0 {self._colors.bg_gradient_start},
+                    stop:1 {self._colors.bg_gradient_end}
+                );
+                border-radius: {self._ui_config.border_radius}px;
+                border: 2px solid {self._colors.border_color};
+            }}
+        """
+
+    def _create_header(self) -> QHBoxLayout:
+        header = QHBoxLayout()
+        title = QLabel("صحبك ابو العنين 🤓")
+        title.setStyleSheet(f"""
+            color: {self._colors.text_secondary};
+            font-weight: bold;
+            letter-spacing: 1px;
+            font-size: 14px;
+        """)
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(34, 34)
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setToolTip("Minimize to tray")
+        close_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {self._colors.border_color};
+                color: white;
+                border-radius: 17px;
+                border: none;
+                font-size: 14px;
+            }}
+            QPushButton:hover {{
+                background: {self._colors.btn_danger};
+            }}
+        """)
+        close_btn.clicked.connect(self._hide_window)
+
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(close_btn)
+        return header
+
+    def _create_time_display(self) -> QLabel:
+        label = QLabel()
+        label.setAlignment(Qt.AlignCenter)
+        label.setStyleSheet(f"""
+            color: {self._colors.text_accent};
+            font-size: 24px;
+            font-weight: 900;
+            margin: 5px 0;
+        """)
+        return label
+
+    def _create_buttons(self) -> QHBoxLayout:
+        layout = QHBoxLayout()
+        layout.setSpacing(12)
+        
+        self._reset_btn = QPushButton("RESET")
+        self._reset_btn.setFixedSize(
+            self._ui_config.button_width,
+            self._ui_config.button_height
+        )
+        self._reset_btn.setCursor(Qt.PointingHandCursor)
+        self._reset_btn.setToolTip("Reset the eye timer to 20 minutes")
+        self._reset_btn.setStyleSheet(self._get_button_style(self._colors.btn_success))
+        self._reset_btn.clicked.connect(self._reset_timer)
+        # Connect reset button to reset auto-hide timer
+        self._reset_btn.clicked.connect(self._reset_auto_hide)
+
+        self._pause_btn = QPushButton("PAUSE")
+        self._pause_btn.setFixedSize(
+            self._ui_config.button_width,
+            self._ui_config.button_height
+        )
+        self._pause_btn.setCursor(Qt.PointingHandCursor)
+        self._pause_btn.setToolTip("Pause/Resume the eye timer")
+        self._pause_btn.setStyleSheet(self._get_button_style(self._colors.btn_warning))
+        self._pause_btn.clicked.connect(self._toggle_pause)
+        self._pause_btn.clicked.connect(self._reset_auto_hide)
+
+        self._ratic_btn = QPushButton("R.A.T.I.C")
+        self._ratic_btn.setFixedSize(
+            self._ui_config.button_width,
+            self._ui_config.button_height
+        )
+        self._ratic_btn.setCursor(Qt.PointingHandCursor)
+        self._ratic_btn.setToolTip("Reset the usage timer (computer active time) to zero")
+        self._ratic_btn.setStyleSheet(self._get_button_style(self._colors.btn_info))
+        self._ratic_btn.clicked.connect(self._reset_usage_timer)
+        self._ratic_btn.clicked.connect(self._reset_auto_hide)
+
+        layout.addWidget(self._reset_btn)
+        layout.addWidget(self._pause_btn)
+        layout.addWidget(self._ratic_btn)
+        return layout
+
+    def _get_button_style(self, color: str) -> str:
+        return f"""
+            QPushButton {{
+                background: {color};
+                color: {self._colors.btn_text};
+                border-radius: {self._ui_config.button_radius}px;
+                font-weight: 900;
+                font-size: 13px;
+                border: none;
+            }}
+            QPushButton:hover {{
+                background: white;
+            }}
+            QPushButton:pressed {{
+                background: {color};
+                opacity: 0.8;
+            }}
+            QPushButton:disabled {{
+                background: {self._colors.btn_disabled_bg};
+                color: {self._colors.btn_disabled_text};
+            }}
+        """
+
+    def _create_usage_label(self) -> QLabel:
+        label = QLabel("Active time: 00:00:00")
+        label.setAlignment(Qt.AlignCenter)
+        label.setStyleSheet(f"""
+            color: {self._colors.text_accent};
+            font-size: 16px;
+            font-weight: bold;
+            margin-top: 5px;
+            padding: 8px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 12px;
+        """)
+        label.setToolTip("Total time you've been active (timer running)")
+        return label
+
+    def _create_status_label(self) -> QLabel:
+        label = QLabel("MONITORING ACTIVE")
+        label.setAlignment(Qt.AlignCenter)
+        label.setStyleSheet(f"""
+            color: {self._colors.text_muted};
+            font-weight: bold;
+            font-size: 11px;
+            margin-top: 8px;
+        """)
+        return label
+
+    def _setup_animations(self) -> None:
+        self._slide_anim = QPropertyAnimation(self, b"pos")
+        self._slide_anim.setDuration(self._timer_config.animation_duration_ms)
+        self._slide_anim.setEasingCurve(QEasingCurve.OutExpo)
+        self._slide_anim.finished.connect(self._on_slide_finished)
+
+        self._progress_anim = QPropertyAnimation(self._progress_bar, b"progress")
+        self._progress_anim.setDuration(self._timer_config.progress_animation_ms)
+        self._progress_anim.setEasingCurve(QEasingCurve.InOutQuad)
+
+    def _setup_timers(self) -> None:
+        self._countdown_timer = QTimer(self)
+        self._countdown_timer.timeout.connect(self._update_countdown)
+        
+        self._auto_hide_timer = QTimer(self)
+        self._auto_hide_timer.setSingleShot(True)
+        self._auto_hide_timer.timeout.connect(self._hide_window)
+
+        self._clock_timer = QTimer(self)
+        self._clock_timer.timeout.connect(self._update_clock)
+        self._clock_timer.start(self._timer_config.clock_update_interval_ms)
+        
+        self._update_clock()
+        self._countdown_timer.start(self._timer_config.countdown_interval_ms)
+
+    def _setup_tray_icon(self) -> None:
+        self._tray_icon = QSystemTrayIcon(self)
+        
+        # Create eye icon
+        pixmap = QPixmap(64, 64)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QColor("#ffffff"))
+        painter.setPen(QPen(QColor("#333333"), 2))
+        painter.drawEllipse(6, 18, 52, 28)
+        iris_gradient = QLinearGradient(24, 20, 40, 44)
+        iris_gradient.setColorAt(0, QColor("#2ecc71"))
+        iris_gradient.setColorAt(0.5, QColor("#27ae60"))
+        iris_gradient.setColorAt(1, QColor("#1e8449"))
+        painter.setBrush(QBrush(iris_gradient))
+        painter.setPen(QPen(QColor("#1a5e32"), 1))
+        painter.drawEllipse(20, 20, 24, 24)
+        painter.setBrush(QColor("#000000"))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(27, 27, 10, 10)
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawEllipse(29, 29, 4, 4)
+        painter.end()
+        
+        self._tray_icon.setIcon(QIcon(pixmap))
+        self._tray_icon.setToolTip("صحبك ابو العنين - Click to toggle")
+        
+        menu = QMenu()
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #2a2a3e;
+                color: white;
+                border: 1px solid #32324d;
+                border-radius: 8px;
+                padding: 5px;
+            }
+            QMenu::item {
+                padding: 8px 20px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background-color: #4cd137;
+                color: #1e1e2f;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #32324d;
+                margin: 5px 10px;
+            }
+        """)
+        
+        show_action = menu.addAction("👁 Toggle Window")
+        show_action.triggered.connect(self._toggle_window)
+        reset_action = menu.addAction("🔄 Quick Reset")
+        reset_action.triggered.connect(self._reset_timer)
+        ratic_action = menu.addAction("⏱ Reset R.A.T.I.C")
+        ratic_action.triggered.connect(self._reset_usage_timer)
+        menu.addSeparator()
+        exit_action = menu.addAction("❌ Exit Program")
+        exit_action.triggered.connect(self._quit_application)
+        
+        self._tray_icon.setContextMenu(menu)
+        self._tray_icon.activated.connect(self._on_tray_activated)
+        self._tray_icon.show()
+
+    # ------------------------------------------------------------------
+    # Auto‑hide reset logic
+    # ------------------------------------------------------------------
+    def _reset_auto_hide(self) -> None:
+        """Reset the auto‑hide timer: cancel current and start fresh."""
+        if self._state in (TimerState.ALARM, TimerState.PAUSED):
+            return  # Do not auto‑hide when alarm or paused
+        if self.isVisible() and not self._is_minimized:
+            self._auto_hide_timer.stop()
+            self._auto_hide_timer.start(self._timer_config.auto_hide_delay_ms)
+            logger.debug("Auto‑hide timer reset")
+
+    # ------------------------------------------------------------------
+    # Usage Timer (R.A.T.I.C) Logic
+    # ------------------------------------------------------------------
+    def _start_usage_timer(self) -> None:
+        if self._state == TimerState.RUNNING and not self._usage_timer.isActive():
+            self._usage_timer.start(1000)
+
+    def _stop_usage_timer(self) -> None:
+        if self._usage_timer.isActive():
+            self._usage_timer.stop()
+
+    def _update_usage_timer(self) -> None:
+        if self._state == TimerState.RUNNING:
+            self._usage_seconds += 1
+            self._update_usage_display()
+        else:
+            self._stop_usage_timer()
+
+    def _update_usage_display(self) -> None:
+        hours = self._usage_seconds // 3600
+        minutes = (self._usage_seconds % 3600) // 60
+        seconds = self._usage_seconds % 60
+        self._usage_label.setText(f"Active time: {hours:02d}:{minutes:02d}:{seconds:02d}")
+
+    def _reset_usage_timer(self) -> None:
+        self._usage_seconds = 0
+        self._update_usage_display()
+        logger.info("R.A.T.I.C reset to zero")
+
+    # ------------------------------------------------------------------
+    # Main Timer Logic
+    # ------------------------------------------------------------------
+    def _update_countdown(self) -> None:
+        if self._state != TimerState.RUNNING:
+            return
+
+        if self._remaining_seconds > 0:
+            self._remaining_seconds -= 1
+            percent = (self._remaining_seconds / self._timer_config.work_duration_seconds) * 100
+            self._progress_bar.setValue(percent)
+            
+            minutes, seconds = divmod(self._remaining_seconds, 60)
+            self._tray_icon.setToolTip(
+                f"صحبك ابو العنين\nTime remaining: {minutes:02d}:{seconds:02d}\nClick to toggle"
+            )
+        else:
+            self._trigger_alarm()
+
+    def _trigger_alarm(self) -> None:
+        self._state = TimerState.ALARM
+        self._countdown_timer.stop()
+        self._progress_bar.setValue(0)
+        self._stop_usage_timer()
+        
+        self._status_label.setText("👁️ protect your eyes pro 👁️\n" \
+        "  __________\n" \
+        " /                    \\\n" \
+        "  ----------------")
+        self._status_label.setStyleSheet(f"""
+            color: {self._colors.btn_success};
+            font-weight: bold;
+            font-size: 16px;
+            margin-top: 10px;
+            padding: 10px;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 10px;
+        """)
+        
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        self._restore_window(auto_hide=False)
+        
+        self._pause_btn.setEnabled(False)
+        self._tray_icon.setToolTip("🔔 صحبك ابو العنين - Time to rest your eyes!\nprotect your eyes pro 👁️")
+        
+        logger.info("Alarm triggered")
+
+    def _reset_timer(self) -> None:
+        self._auto_hide_timer.stop()
+        
+        self._remaining_seconds = self._timer_config.work_duration_seconds
+        self._is_first_launch = False
+        
+        if self._state == TimerState.ALARM:
+            self._state = TimerState.RUNNING
+            self._pause_btn.setEnabled(True)
+            self._pause_btn.setText("PAUSE")
+        
+        if self._state == TimerState.PAUSED:
+            self._status_label.setText("⏸ PAUSED")
+            self._status_label.setStyleSheet(f"""
+                color: {self._colors.btn_warning};
+                font-weight: bold;
+                font-size: 14px;
+                margin-top: 10px;
+            """)
+            self._countdown_timer.stop()
+        else:
+            self._status_label.setText("MONITORING ACTIVE")
+            self._status_label.setStyleSheet(f"""
+                color: {self._colors.text_muted};
+                font-weight: bold;
+                font-size: 11px;
+                margin-top: 10px;
+            """)
+            self._countdown_timer.stop()
+            self._countdown_timer.start(self._timer_config.countdown_interval_ms)
+            self._start_usage_timer()
+        
+        self._progress_bar.setValue(100)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowStaysOnTopHint)
+        self.show()
+        
+        if self._state != TimerState.PAUSED:
+            self._start_auto_hide()
+        
+        self._tray_icon.setToolTip("صحبك ابو العنين - Click to toggle")
+        self._audio_manager.stop()
+        
+        logger.info("Timer reset")
+
+    def _toggle_pause(self) -> None:
+        if self._state == TimerState.ALARM:
+            return
+            
+        if self._state == TimerState.PAUSED:
+            self._state = TimerState.RUNNING
+            self._pause_btn.setText("PAUSE")
+            self._status_label.setText("MONITORING ACTIVE")
+            self._status_label.setStyleSheet(f"""
+                color: {self._colors.text_muted};
+                font-weight: bold;
+                font-size: 11px;
+                margin-top: 10px;
+            """)
+            self._countdown_timer.start(self._timer_config.countdown_interval_ms)
+            self._start_usage_timer()
+            if self.isVisible() and not self._is_minimized:
+                self._start_auto_hide()
+            logger.info("Timer resumed")
+        else:
+            self._state = TimerState.PAUSED
+            self._pause_btn.setText("RESUME")
+            self._status_label.setText("⏸ PAUSED")
+            self._status_label.setStyleSheet(f"""
+                color: {self._colors.btn_warning};
+                font-weight: bold;
+                font-size: 14px;
+                margin-top: 10px;
+            """)
+            self._countdown_timer.stop()
+            self._stop_usage_timer()
+            self._auto_hide_timer.stop()
+            logger.info("Timer paused")
+
+    def _update_clock(self) -> None:
+        self._time_display.setText(QTime.currentTime().toString("hh:mm:ss AP"))
+
+    # ------------------------------------------------------------------
+    # Window Management
+    # ------------------------------------------------------------------
+    def _toggle_window(self) -> None:
+        if self.isVisible() and not self._is_minimized:
+            self._hide_window()
+        else:
+            self._restore_window(auto_hide=True)
+            self.raise_()
+            self.activateWindow()
+            self.setWindowState(self.windowState() & ~Qt.WindowMinimized)
+            self._reset_auto_hide()
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self._toggle_window()
+
+    def _on_slide_finished(self) -> None:
+        self._is_animating = False
+        if self._is_minimized:
+            self.hide()
+
+    def _hide_window(self) -> None:
+        if self._is_animating:
+            return
+        self._auto_hide_timer.stop()
+        self._original_pos = self.pos()
+        self._is_animating = True
+        self._is_minimized = True
+        target_y = self.pos().y() + self.height() + 50
+        self._slide_anim.setStartValue(self.pos())
+        self._slide_anim.setEndValue(QPoint(self.pos().x(), target_y))
+        self._slide_anim.start()
+
+    def _restore_window(self, auto_hide: bool = True) -> None:
+        self.show()
+        if self._is_animating:
+            self._slide_anim.stop()
+        self._is_minimized = False
+        self._is_animating = True
+        self._slide_anim.setStartValue(self.pos())
+        self._slide_anim.setEndValue(self._original_pos)
+        self._slide_anim.start()
+        if auto_hide and self._state not in (TimerState.ALARM, TimerState.PAUSED):
+            self._start_auto_hide()
+
+    def _start_auto_hide(self) -> None:
+        if self._state not in (TimerState.ALARM, TimerState.PAUSED) and self.isVisible():
+            delay = self._timer_config.auto_hide_delay_ms
+            self._auto_hide_timer.start(delay)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._is_minimized and not self._auto_hide_timer.isActive():
+            self._start_auto_hide()
+
+    # ------------------------------------------------------------------
+    # Mouse Events for Dragging & Resetting Auto‑Hide
+    # ------------------------------------------------------------------
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            # Reset auto‑hide on any click inside the window
+            self._reset_auto_hide()
+            if event.pos().y() < 60:
+                self._drag_offset = event.pos()
+
+    def mouseMoveEvent(self, event) -> None:
+        if not self._drag_offset.isNull():
+            new_pos = self.mapToGlobal(event.pos() - self._drag_offset)
+            self.move(new_pos)
+            if not self._is_minimized:
+                self._original_pos = new_pos
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._drag_offset = QPoint()
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+    def _quit_application(self) -> None:
+        self._usage_timer.stop()
+        self._audio_manager.cleanup()
+        self._tray_icon.hide()
+        QApplication.quit()
+
+    def closeEvent(self, event) -> None:
+        event.ignore()
+        self._hide_window()
+
+
+# ----------------------------------------------------------------------
+# Application Entry Point
+# ----------------------------------------------------------------------
+def main() -> int:
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setQuitOnLastWindowClosed(False)
+    
+    window = EyeProtectionAlarm()
+    window.show()
+    
+    return app.exec_()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
