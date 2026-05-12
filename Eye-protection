@@ -1,9 +1,8 @@
 """
 صحبك ابو العنين 🤓 - Eye Protection Alarm with Usage Timer (R.A.T.I.C)
 
-A desktop application to remind users to rest their eyes (20‑20‑20 rule).
-Features a circular progress timer, system tray integration, pause/resume,
-and a separate usage timer that tracks total active computer time.
+# Heavily Vibe Coded
+
 """
 
 from __future__ import annotations
